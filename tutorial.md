@@ -56,14 +56,15 @@ gcloud compute networks create "demo" --subnet-mode "custom"
 gcloud compute networks subnets create "demo-tokyo" --network "demo" --region "asia-northeast1" --range "192.168.0.0/24" --enable-private-ip-google-access
 ```
 
-この `demo` というグローバル ネットワークに対し、[Identity-Aware Proxy](https://cloud.google.com/iap?hl=ja)、または内部ネットワークからの接続を許可します。
+この `demo` というグローバル ネットワークに対し、[Identity-Aware Proxy](https://cloud.google.com/iap?hl=ja)、内部ネットワーク、またはロードバランサーからの接続を許可します。
 
 ```bash
 gcloud compute firewall-rules create allow-from-iap --network "demo" --direction "INGRESS" --priority 1000 --action "ALLOW" --rules "tcp:22,icmp" --source-ranges "35.235.240.0/20"
 gcloud compute firewall-rules create allow-from-internal --network "demo" --direction "INGRESS" --priority 1000 --action "ALLOW" --rules "all" --source-ranges "192.168.0.0/24"
+gcloud compute firewall-rules create allow-health-checks --network "demo" --direction "INGRESS" --priority 1000 --action "ALLOW" --rules "tcp:80,tcp:443" --source-ranges "130.211.0.0/22,35.191.0.0/16" --target-tags "http-server"
 ```
 
-クラウドのコンソールから設定情報を確認してみましょう。  
+クラウドのコンソールから設定情報を確認してみましょう。
 https://console.cloud.google.com/networking/networks/list
 
 ## 3. GCS バケットに静的コンテンツをアップロードする
@@ -109,7 +110,7 @@ export HMAC_ACCESS_KEY="<表示された accessId>"
 export HMAC_SECRET="<表示された secret>"
 ```
 
-クラウドのコンソールから Cloud Storage の中身を確認してみましょう。  
+クラウドのコンソールから Cloud Storage の中身を確認してみましょう。
 https://console.cloud.google.com/storage/browser
 
 ## 4. ロードバランサーの作成
@@ -120,7 +121,7 @@ https://console.cloud.google.com/storage/browser
 gcloud compute addresses create "${YOUR_ID}-lb-ip" --global
 ```
 
-あなたの現在の接続元 IP アドレスを確認してみましょう。  
+あなたの現在の接続元 IP アドレスを確認してみましょう。
 https://api.myip.com/
 
 それを考慮しつつ、接続を許可する IP アドレスを指定してください。
@@ -169,10 +170,70 @@ gcloud compute forwarding-rules create "http-forward" --load-balancing-scheme "E
 - https://console.cloud.google.com/net-services/loadbalancing/list/loadBalancers
 - https://console.cloud.google.com/net-security/securitypolicies/list
 
-では
+最後に接続確認です。以下で返ってくる URL にアクセスしてみましょう。
+ロードバランサーや IP アドレス制限がもれなく反映されるまで 10 分程度かかる可能性もあります。気長にお待ちください。
 
 ```bash
-echo "http://$( gcloud compute addresses describe "${YOUR_ID}-lb-ip" --global --format='value(address)' )/"
+echo "http://$( gcloud compute addresses describe "${YOUR_ID}-lb-ip" --global --format='value(address)' )/index.html"
+```
+
+## 5. Web サーバーの起動
+
+起動したいサーバーの条件をテンプレートとして登録します。
+
+```bash
+gcloud compute instance-templates create "demo-server" --machine-type "n2-standard-2" --image-family "debian-11" --image-project "debian-cloud" --tags "http-server" --metadata-from-file "startup-script=startup.sh"
+```
+
+マネージド インスタンスグループ (MIG) というサーバーの集合（といいつつ 1 台のみ）を作成します。
+
+```bash
+gcloud compute instance-groups managed create "demo-servers" --template "demo-server" --base-instance-name "demo-server" --size 1 --zone "asia-northeast1-b"
+```
+
+OS Login でサーバーの中に入ってみましょう。Y/n を聞かれたら Y、その後ローカルで鍵を作成する確認があったら Enter を 2 度押してください。
+
+```bash
+export demo_server_name=$( gcloud compute instances list --filter="name~'^demo-server'" --format="value(name)" )
+gcloud compute ssh "${demo_server_name}" --zone "asia-northeast1-b"
+```
+
+サーバーに入ったら Flask（Python 製 Web サーバー）が起動していることを確認したら、Python を書き換えられるようサーバー上の権限設定を変更し、ログアウトしましょう。
+
+```bash
+curl -i http://localhost/api/gemini
+sudo chown -R $USER /apps
+logout
+```
+
+ローカルで app.py を編集し、それを Web サーバーに送信、応答が変化することを確かめてみましょう。
+
+```bash
+gcloud compute scp main.py "${demo_server_name}:/apps/main.py" --zone "asia-northeast1-b"
+gcloud compute ssh "${demo_server_name}" --zone "asia-northeast1-b" -- curl -i http://localhost/api/gemini
+```
+
+## 6. ロードバランサーの設定変更
+
+Web サーバーが正しく起動していることを確認する "ヘルスチェック" とロードバランサーのバックエンド サービスを設定します。
+
+```bash
+gcloud compute health-checks create http "vm-http-health-check" --port 80 --global
+gcloud compute backend-services create "vm-backend" --load-balancing-scheme "EXTERNAL_MANAGED" --protocol HTTP --port-name "http" --health-checks "vm-http-health-check" --global
+gcloud compute backend-services add-backend "vm-backend" --instance-group "demo-servers" --instance-group-zone "asia-northeast1-b" --global
+gcloud compute backend-services update "vm-backend" --security-policy "${YOUR_ID}-armor-policy" --global
+```
+
+URL が /api/ で始まる場合は Web サーバーへルーティングするようロードバランサーの設定を変更します。
+
+```bash
+gcloud compute url-maps add-path-matcher "demo-${YOUR_ID}-urlmap" --default-service "gcs-backend" --path-matcher-name "web-path-matcher" --path-rules "^/api/.*=vm-backend"
+```
+
+最後に、Gemini の実装をするであろう API 以下にアクセスしてみましょう！
+
+```bash
+echo "http://$( gcloud compute addresses describe "${YOUR_ID}-lb-ip" --global --format='value(address)' )/api/gemini"
 ```
 
 ## これで終わりです
