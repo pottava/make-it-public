@@ -64,8 +64,19 @@ gcloud compute firewall-rules create allow-from-internal --network "demo" --dire
 gcloud compute firewall-rules create allow-health-checks --network "demo" --direction "INGRESS" --priority 1000 --action "ALLOW" --rules "tcp:80,tcp:443" --source-ranges "130.211.0.0/22,35.191.0.0/16" --target-tags "http-server"
 ```
 
-クラウドのコンソールから設定情報を確認してみましょう。
-https://console.cloud.google.com/networking/networks/list
+クラウドのコンソールから [VPC ネットワーク](https://console.cloud.google.com/networking/networks/list) の状態を確認してみましょう。
+
+後半でサーバーが公開 IP アドレスを持たずに済むよう、[Cloud NAT](https://cloud.google.com/nat/docs/overview?hl=ja) を設置します。まず Cloud Router を作り
+
+```bash
+gcloud compute routers create nat-router --network "demo" --region "asia-northeast1"
+```
+
+いま作成したルータを指定し、Cloud NAT を作成します。
+
+```bash
+gcloud compute routers nats create nat-config --router "nat-router" --region "asia-northeast1" --auto-allocate-nat-external-ips --nat-all-subnet-ip-ranges --enable-logging
+```
 
 ## 3. GCS バケットに静的コンテンツをアップロードする
 
@@ -83,12 +94,14 @@ gcloud storage buckets create "gs://demo-202504-${YOUR_ID}" --location "asia-nor
 
 index.html と style.css をアップロードしてみましょう。
 
-```bash
+```text
 echo '<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>サンプル</title><link rel="stylesheet" href="style.css"></head><body><h1>Hello <span class="blue">G</span><span class="red">o</span><span class="yellow">o</span><span class="blue">g</span><span class="green">l</span><span class="red">e</span>!</h1></body></html>' > index.html
 gcloud storage cp index.html "gs://demo-202504-${YOUR_ID}"
 echo '.blue { color: #4285F4; } .red { color: #EA4335; } .yellow { color: #FBBC05; } .green  { color: #34A853; }' > style.css
 gcloud storage cp style.css "gs://demo-202504-${YOUR_ID}"
 ```
+
+クラウドのコンソールから [Cloud Storage](https://console.cloud.google.com/storage/browser) のバケットとその中身を確認してみましょう。
 
 GCS アクセス用サービスアカウントを作り
 
@@ -105,13 +118,10 @@ gcloud storage hmac create "hmac-for-demo-${YOUR_ID}@${GOOGLE_CLOUD_PROJECT}.iam
 
 画面に表示された値を環境変数に保存してください。
 
-```bash
+```text
 export HMAC_ACCESS_KEY="<表示された accessId>"
 export HMAC_SECRET="<表示された secret>"
 ```
-
-クラウドのコンソールから Cloud Storage の中身を確認してみましょう。
-https://console.cloud.google.com/storage/browser
 
 ## 4. ロードバランサーの作成
 
@@ -127,7 +137,7 @@ https://api.myip.com/
 それを考慮しつつ、接続を許可する IP アドレスを指定してください。
 
 ```bash
-export ALLOWED_IP_RANGE="$( curl -4 ifconfig.me )/32"
+export ALLOWED_IP_RANGE="$( curl -s4 ifconfig.me )/32"
 ```
 
 Cloud Armor のセキュリティ ポリシーを作成します。
@@ -165,16 +175,18 @@ gcloud compute target-http-proxies create "http-proxy" --url-map "demo-${YOUR_ID
 gcloud compute forwarding-rules create "http-forward" --load-balancing-scheme "EXTERNAL_MANAGED" --address "${YOUR_ID}-lb-ip" --target-http-proxy "http-proxy" --ports 80 --global
 ```
 
-クラウドのコンソールからロードバランサーや WAF の設定を確認してみましょう。
+クラウドのコンソールから[ロードバランサー](https://console.cloud.google.com/net-services/loadbalancing/list/loadBalancers)や [WAF](https://console.cloud.google.com/net-security/securitypolicies/list) の設定を確認してみましょう。
 
-- https://console.cloud.google.com/net-services/loadbalancing/list/loadBalancers
-- https://console.cloud.google.com/net-security/securitypolicies/list
-
-最後に接続確認です。以下で返ってくる URL にアクセスしてみましょう。
-ロードバランサーや IP アドレス制限がもれなく反映されるまで 10 分程度かかる可能性もあります。気長にお待ちください。
+最後に接続確認です。以下で返ってくる URL にアクセスしてみましょう。ロードバランサーや IP アドレス制限がもれなく反映されるまで 10 分程度かかる可能性もあります。気長にお待ちください。
 
 ```bash
-echo "http://$( gcloud compute addresses describe "${YOUR_ID}-lb-ip" --global --format='value(address)' )/index.html"
+echo "http://$( gcloud compute addresses describe ${YOUR_ID}-lb-ip --global --format 'value(address)' )/index.html"
+```
+
+この手順を実行している環境によっては、ブラウザからのアクセスは制限されているのが正常です。
+
+```bash
+curl -siXGET "http://$( gcloud compute addresses describe ${YOUR_ID}-lb-ip --global --format 'value(address)' )/index.html"
 ```
 
 ## 5. Web サーバーの起動
@@ -182,7 +194,7 @@ echo "http://$( gcloud compute addresses describe "${YOUR_ID}-lb-ip" --global --
 起動したいサーバーの条件をテンプレートとして登録します。
 
 ```bash
-gcloud compute instance-templates create "demo-server" --machine-type "n2-standard-2" --image-family "debian-11" --image-project "debian-cloud" --tags "http-server" --metadata-from-file "startup-script=startup.sh"
+gcloud compute instance-templates create "demo-server" --machine-type "n2-standard-2" --network "demo" --subnet "demo-tokyo" --no-address --region "asia-northeast1" --image-family "debian-11" --image-project "debian-cloud" --shielded-secure-boot --shielded-vtpm --tags "http-server" --metadata-from-file "startup-script=startup.sh"
 ```
 
 マネージド インスタンスグループ (MIG) というサーバーの集合（といいつつ 1 台のみ）を作成します。
@@ -191,6 +203,8 @@ gcloud compute instance-templates create "demo-server" --machine-type "n2-standa
 gcloud compute instance-groups managed create "demo-servers" --template "demo-server" --base-instance-name "demo-server" --size 1 --zone "asia-northeast1-b"
 ```
 
+クラウドのコンソールから [VM インスタンス](https://console.cloud.google.com/compute/instances) の状態を確認してみましょう。
+
 OS Login でサーバーの中に入ってみましょう。Y/n を聞かれたら Y、その後ローカルで鍵を作成する確認があったら Enter を 2 度押してください。
 
 ```bash
@@ -198,10 +212,15 @@ export demo_server_name=$( gcloud compute instances list --filter="name~'^demo-s
 gcloud compute ssh "${demo_server_name}" --zone "asia-northeast1-b"
 ```
 
-サーバーに入ったら Flask（Python 製 Web サーバー）が起動していることを確認したら、Python を書き換えられるようサーバー上の権限設定を変更し、ログアウトしましょう。
+サーバーに入ったら Flask（Python 製 Web サーバー）が起動していることを確認し
 
 ```bash
 curl -i http://localhost/api/gemini
+```
+
+動いていそうであれば、Python を書き換えられるようサーバー上の権限設定を変更し、ログアウトしましょう。
+
+```bash
 sudo chown -R $USER /apps
 logout
 ```
@@ -230,10 +249,12 @@ URL が /api/ で始まる場合は Web サーバーへルーティングする�
 gcloud compute url-maps add-path-matcher "demo-${YOUR_ID}-urlmap" --default-service "gcs-backend" --path-matcher-name "web-path-matcher" --path-rules "^/api/.*=vm-backend"
 ```
 
+[ロードバランサー](https://console.cloud.google.com/net-services/loadbalancing/list/loadBalancers)の設定がどのように変わったかを確認してみましょう。
+
 最後に、Gemini の実装をするであろう API 以下にアクセスしてみましょう！
 
 ```bash
-echo "http://$( gcloud compute addresses describe "${YOUR_ID}-lb-ip" --global --format='value(address)' )/api/gemini"
+echo "http://$( gcloud compute addresses describe ${YOUR_ID}-lb-ip --global --format='value(address)' )/api/gemini"
 ```
 
 ## これで終わりです

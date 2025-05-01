@@ -14,5 +14,6 @@ git clone https://github.com/pottava/make-it-public.git
 以下のコマンドでチュートリアルが起動しましょう。
 
 ```sh
-teachme make-it-public/tutorial.md
+cd make-it-public/
+teachme tutorial.md
 ```
