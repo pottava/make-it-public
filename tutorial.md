@@ -191,10 +191,17 @@ curl -siXGET "http://$( gcloud compute addresses describe ${YOUR_ID}-lb-ip --glo
 
 ## 5. Web サーバーの起動
 
+デモアプリケーションに必要最小限の設定を与えるための[サービス アカウント](https://cloud.google.com/iam/docs/service-account-overview?hl=ja)を作ります。
+
+```bash
+gcloud iam service-accounts create gemini-api-sa --display-name "Service Account for Gemini API via Vertex AI"
+gcloud projects add-iam-policy-binding ${GOOGLE_CLOUD_PROJECT} --member "serviceAccount:gemini-api-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com" --role "roles/aiplatform.user"
+```
+
 起動したいサーバーの条件をテンプレートとして登録します。
 
 ```bash
-gcloud compute instance-templates create "demo-server" --machine-type "n2-standard-2" --network "demo" --subnet "demo-tokyo" --no-address --region "asia-northeast1" --image-family "debian-11" --image-project "debian-cloud" --shielded-secure-boot --shielded-vtpm --tags "http-server" --metadata-from-file "startup-script=startup.sh"
+gcloud compute instance-templates create "demo-server" --machine-type "n2-standard-2" --network "demo" --subnet "demo-tokyo" --no-address --region "asia-northeast1" --image-family "debian-11" --image-project "debian-cloud" --shielded-secure-boot --shielded-vtpm --service-account "gemini-api-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com" --tags "http-server" --metadata-from-file "startup-script=startup.sh"
 ```
 
 マネージド インスタンスグループ (MIG) というサーバーの集合（といいつつ 1 台のみ）を作成します。
@@ -203,7 +210,15 @@ gcloud compute instance-templates create "demo-server" --machine-type "n2-standa
 gcloud compute instance-groups managed create "demo-servers" --template "demo-server" --base-instance-name "demo-server" --size 1 --zone "asia-northeast1-b"
 ```
 
+インスタンスグループを負荷分散対象にするために「名前付きポート」というものを設定しておきます。
+
+```bash
+gcloud compute instance-groups set-named-ports "demo-servers" --named-ports "http:80" --zone "asia-northeast1-b"
+```
+
 クラウドのコンソールから [VM インスタンス](https://console.cloud.google.com/compute/instances) の状態を確認してみましょう。
+
+## 6. Gemini による生成 AI の応答
 
 OS Login でサーバーの中に入ってみましょう。Y/n を聞かれたら Y、その後ローカルで鍵を作成する確認があったら Enter を 2 度押してください。
 
@@ -215,7 +230,7 @@ gcloud compute ssh "${demo_server_name}" --zone "asia-northeast1-b"
 サーバーに入ったら Flask（Python 製 Web サーバー）が起動していることを確認し
 
 ```bash
-curl -i http://localhost/api/gemini
+curl -i http://localhost/apis/gemini
 ```
 
 動いていそうであれば、Python を書き換えられるようサーバー上の権限設定を変更し、ログアウトしましょう。
@@ -225,28 +240,34 @@ sudo chown -R $USER /apps
 logout
 ```
 
+サーバー上に Google の [Gen AI SDK](https://cloud.google.com/vertex-ai/generative-ai/docs/sdks/overview?hl=ja) をインストールします。
+
+```bash
+gcloud compute ssh "${demo_server_name}" --zone "asia-northeast1-b" -- 'cd /apps && pip install google-genai'
+```
+
 ローカルで app.py を編集し、それを Web サーバーに送信、応答が変化することを確かめてみましょう。
 
 ```bash
 gcloud compute scp main.py "${demo_server_name}:/apps/main.py" --zone "asia-northeast1-b"
-gcloud compute ssh "${demo_server_name}" --zone "asia-northeast1-b" -- curl -i http://localhost/api/gemini
+gcloud compute ssh "${demo_server_name}" --zone "asia-northeast1-b" -- curl -i http://localhost/apis/gemini
 ```
 
-## 6. ロードバランサーの設定変更
+## 7. ロードバランサーの設定変更
 
 Web サーバーが正しく起動していることを確認する "ヘルスチェック" とロードバランサーのバックエンド サービスを設定します。
 
 ```bash
-gcloud compute health-checks create http "vm-http-health-check" --port 80 --global
+gcloud compute health-checks create http "vm-http-health-check" --port 80 --enable-logging --global
 gcloud compute backend-services create "vm-backend" --load-balancing-scheme "EXTERNAL_MANAGED" --protocol HTTP --port-name "http" --health-checks "vm-http-health-check" --global
 gcloud compute backend-services add-backend "vm-backend" --instance-group "demo-servers" --instance-group-zone "asia-northeast1-b" --global
 gcloud compute backend-services update "vm-backend" --security-policy "${YOUR_ID}-armor-policy" --global
 ```
 
-URL が /api/ で始まる場合は Web サーバーへルーティングするようロードバランサーの設定を変更します。
+URL が /apis/ で始まる場合は Web サーバーへルーティングするようロードバランサーの設定を変更します。
 
 ```bash
-gcloud compute url-maps add-path-matcher "demo-${YOUR_ID}-urlmap" --default-service "gcs-backend" --path-matcher-name "web-path-matcher" --path-rules "^/api/.*=vm-backend"
+gcloud compute url-maps add-path-matcher "demo-${YOUR_ID}-urlmap" --default-service "gcs-backend" --path-matcher-name "web-path-matcher" --path-rules "/apis/*=vm-backend"
 ```
 
 [ロードバランサー](https://console.cloud.google.com/net-services/loadbalancing/list/loadBalancers)の設定がどのように変わったかを確認してみましょう。
@@ -254,7 +275,7 @@ gcloud compute url-maps add-path-matcher "demo-${YOUR_ID}-urlmap" --default-serv
 最後に、Gemini の実装をするであろう API 以下にアクセスしてみましょう！
 
 ```bash
-echo "http://$( gcloud compute addresses describe ${YOUR_ID}-lb-ip --global --format='value(address)' )/api/gemini"
+echo "http://$( gcloud compute addresses describe ${YOUR_ID}-lb-ip --global --format='value(address)' )/apis/gemini"
 ```
 
 ## これで終わりです

@@ -11,10 +11,10 @@ from flask import Flask
 app = Flask(__name__)
 
 @app.route("/")
-def hello():
+def index():
     return "Hello!"
 
-@app.route("/api/gemini")
+@app.route("/apis/gemini")
 def gemini():
     return "Hey Gemini:)"
 
